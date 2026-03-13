@@ -1,0 +1,49 @@
+# ============================================================================
+# ARC — Asymmetric Reaction Capture
+# .gitignore
+# ============================================================================
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# --- Virtual Environment ---
+venv/
+.venv/
+env/
+.env
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# --- Secrets (NEVER commit) ---
+secrets.env
+*.env
+!.env.example
+
+# --- Data & Logs (local only) ---
+data/*.csv
+data/*.json
+data/*.parquet
+!data/.gitkeep
+logs/
+!logs/.gitkeep
+
+# --- Session artifacts ---
+sessions/
+
+# --- OS ---
+.DS_Store
+Thumbs.db

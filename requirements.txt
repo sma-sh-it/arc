@@ -1,0 +1,27 @@
+# ============================================================================
+# ARC — Asymmetric Reaction Capture
+# Python Dependencies
+# ============================================================================
+
+# --- Core ---
+pyyaml>=6.0                  # Config file parsing
+python-dotenv>=1.0           # Secrets loading from .env files
+aiohttp>=3.9                 # Async HTTP for Kraken REST API
+websockets>=12.0             # Kraken WebSocket feeds
+
+# --- Kraken ---
+krakenex>=2.2                # Kraken API wrapper (reference/fallback)
+
+# --- Notifications ---
+requests>=2.31               # Pushover + Telegram HTTP calls
+
+# --- Data & Analysis ---
+pandas>=2.1                  # Backtest data handling + reporting
+numpy>=1.26                  # Numerical computations
+
+# --- Logging ---
+colorlog>=6.7                # Colored console logging
+
+# --- Testing ---
+pytest>=7.4                  # Test framework
+pytest-asyncio>=0.23         # Async test support
