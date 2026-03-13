@@ -1,0 +1,612 @@
+// ============================================================================
+// Lead-Lag Signal Detector v2.0
+// ============================================================================
+//
+// PURPOSE:
+//   Detects when a configurable "leading" symbol makes a VOLUME-CONFIRMED
+//   DIRECTIONAL REVERSAL before the chart symbol follows suit. Highlights
+//   the lag window with colored background bands.
+//
+// SIGNAL MODEL:
+//   TRIGGER (Leader):
+//     1. Leader direction flips (EMA slope sign change or ROC zero-cross)
+//     2. Leader volume on the flip bar > X× its N-bar moving average
+//     Both must be true simultaneously. A flip on thin volume = noise.
+//
+//   CONFIRMATION (Chart Symbol / Follower):
+//     1. Chart symbol moves ≥ N% in the SAME direction as the leader's flip
+//     2. Chart symbol volume > Y× its N-bar moving average
+//     Both must be true simultaneously. Price move without volume = noise.
+//
+//   BACKGROUND:
+//     Colors from the trigger bar until confirmation or timeout.
+//     Red = leader flipped bearish, waiting for follower to follow down.
+//     Green = leader flipped bullish, waiting for follower to follow up.
+//
+// USE CASES:
+//   - WLFI leading BTC (apply to BTCUSD, set leader = WLFIUSD)
+//   - ETH leading altcoin moves
+//   - DXY leading gold inversions
+//   - Any pair where Asset A reverses before Asset B follows
+//
+// WHAT CHANGED FROM v1.x:
+//   v1.x triggered on leader MAGNITUDE (% spike) — missed gradual reversals.
+//   v2.0 triggers on leader DIRECTION FLIP + VOLUME — catches the turn
+//   itself, which is the actual predictive event.
+//
+// VERSION: 2.0
+// DATE:    2026-03-13
+//
+// CHANGELOG:
+//   v2.0 (2026-03-13)
+//     - Complete detection rewrite: trigger is now direction flip (EMA
+//       slope sign change or ROC zero-cross) + volume spike on leader.
+//     - Confirmation now requires BOTH price ≥ N% AND volume spike on
+//       the chart symbol.
+//     - Added selectable flip detection method (EMA Slope vs ROC).
+//     - Added volume MA length and multiplier inputs for both symbols.
+//     - Retained debug mode, info table, and all visual settings.
+//   v1.3 (2026-03-13)
+//     - Lowered default thresholds for 5min charts.
+//     - Enlarged info table fonts.
+//   v1.2 (2026-03-13)
+//     - Added debug plots.
+//   v1.1 (2026-03-13)
+//     - Added divergence gate.
+//   v1.0 (2026-03-13)
+//     - Initial release. Magnitude-based trigger.
+// ============================================================================
+
+//@version=5
+indicator(
+     title      = "Lead-Lag Signal Detector",
+     shorttitle = "Lead-Lag v2",
+     overlay    = true,
+     max_labels_count = 500
+     )
+
+// ============================================================================
+// INPUT GROUP: Leading Symbol
+// ============================================================================
+
+string i_leadSymbol = input.symbol(
+     defval  = "WLFIUSD",
+     title   = "Leading Symbol",
+     tooltip = "The asset that moves first. Full TradingView symbol " +
+               "notation including exchange prefix if needed.",
+     group   = "Leading Symbol"
+     )
+
+string i_leadTimeframe = input.timeframe(
+     defval  = "",
+     title   = "Leading Symbol Timeframe",
+     tooltip = "Leave blank to match the chart timeframe. Set a specific " +
+               "timeframe to force the leader's data resolution.",
+     group   = "Leading Symbol"
+     )
+
+// ============================================================================
+// INPUT GROUP: Direction Flip Detection (Leader)
+// ============================================================================
+
+string i_flipMethod = input.string(
+     defval  = "EMA Slope",
+     title   = "Flip Detection Method",
+     options = ["EMA Slope", "ROC Zero-Cross"],
+     tooltip = "How to detect the leader's direction change.\n" +
+               "EMA Slope: short EMA slope changes sign (smoother, slight delay).\n" +
+               "ROC Zero-Cross: rate of change crosses zero (faster, more noise).",
+     group   = "Direction Flip Detection"
+     )
+
+int i_emaLength = input.int(
+     defval  = 5,
+     title   = "EMA Length (for EMA Slope method)",
+     minval  = 2,
+     maxval  = 50,
+     tooltip = "Length of the short EMA used to compute slope. Smaller = " +
+               "more responsive to turns, larger = smoother but laggier.",
+     group   = "Direction Flip Detection"
+     )
+
+int i_rocLength = input.int(
+     defval  = 3,
+     title   = "ROC Length (for ROC method)",
+     minval  = 1,
+     maxval  = 50,
+     tooltip = "Number of bars for Rate of Change calculation. Zero-cross " +
+               "of ROC signals a direction flip.",
+     group   = "Direction Flip Detection"
+     )
+
+// ============================================================================
+// INPUT GROUP: Volume Validation
+// ============================================================================
+
+int i_volMaLength = input.int(
+     defval  = 20,
+     title   = "Volume MA Length",
+     minval  = 5,
+     maxval  = 100,
+     tooltip = "Length of the simple moving average used as the volume " +
+               "baseline for both leader and chart symbol.",
+     group   = "Volume Validation"
+     )
+
+float i_leadVolMult = input.float(
+     defval  = 1.5,
+     title   = "Leader Volume Multiplier",
+     minval  = 0.5,
+     step    = 0.25,
+     tooltip = "Leader volume must exceed this multiple of its volume MA " +
+               "on the flip bar for the trigger to fire. Higher = fewer " +
+               "but higher-conviction triggers.",
+     group   = "Volume Validation"
+     )
+
+float i_chartVolMult = input.float(
+     defval  = 1.5,
+     title   = "Chart Volume Multiplier",
+     minval  = 0.5,
+     step    = 0.25,
+     tooltip = "Chart symbol volume must exceed this multiple of its " +
+               "volume MA on the confirmation bar. Higher = fewer but " +
+               "higher-conviction confirmations.",
+     group   = "Volume Validation"
+     )
+
+// ============================================================================
+// INPUT GROUP: Confirmation (Chart Symbol)
+// ============================================================================
+
+float i_chartThreshold = input.float(
+     defval  = 0.3,
+     title   = "Chart Confirmation Threshold (%)",
+     minval  = 0.1,
+     step    = 0.1,
+     tooltip = "Minimum % move in the chart symbol in the leader's flip " +
+               "direction to count as confirmation. This is the PRICE " +
+               "component — volume is checked separately.",
+     group   = "Confirmation"
+     )
+
+int i_chartPctLookback = input.int(
+     defval  = 3,
+     title   = "Chart % Change Lookback (bars)",
+     minval  = 1,
+     maxval  = 50,
+     tooltip = "Number of bars over which to compute the chart symbol's " +
+               "rolling % change for confirmation purposes.",
+     group   = "Confirmation"
+     )
+
+int i_maxLeadBars = input.int(
+     defval  = 20,
+     title   = "Max Lead Window (bars)",
+     minval  = 1,
+     maxval  = 200,
+     tooltip = "Maximum bars to wait for confirmation. If the chart symbol " +
+               "doesn't confirm within this window, signal times out.",
+     group   = "Confirmation"
+     )
+
+// ============================================================================
+// INPUT GROUP: Visual Settings
+// ============================================================================
+
+color i_bullColor = input.color(
+     defval  = color.new(color.green, 85),
+     title   = "Bullish Lead Background",
+     group   = "Visual Settings"
+     )
+
+color i_bearColor = input.color(
+     defval  = color.new(color.red, 85),
+     title   = "Bearish Lead Background",
+     group   = "Visual Settings"
+     )
+
+color i_timeoutColor = input.color(
+     defval  = color.new(color.gray, 90),
+     title   = "Timeout Background",
+     group   = "Visual Settings"
+     )
+
+bool i_showLabels = input.bool(
+     defval  = true,
+     title   = "Show Signal Labels",
+     group   = "Visual Settings"
+     )
+
+bool i_showLeadCount = input.bool(
+     defval  = true,
+     title   = "Show Lead Bar Count",
+     group   = "Visual Settings"
+     )
+
+string i_tablePos = input.string(
+     defval  = "Top Right",
+     title   = "Info Table Position",
+     options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "None"],
+     group   = "Visual Settings"
+     )
+
+// ============================================================================
+// INPUT GROUP: Debug
+// ============================================================================
+
+bool i_debug = input.bool(
+     defval  = false,
+     title   = "Show Debug Markers",
+     tooltip = "Shows markers for direction flips (diamonds), volume spikes " +
+               "(triangles), and chart confirmations (crosses).",
+     group   = "Debug"
+     )
+
+// ============================================================================
+// SECTION: Resolve Table Position
+// ============================================================================
+
+var string tablePosition = switch i_tablePos
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right"  => position.bottom_right
+    "Bottom Left"   => position.bottom_left
+    => position.top_right
+
+// ============================================================================
+// SECTION: Fetch Leader Data (Price + Volume)
+// ============================================================================
+
+// Pull leader close price
+float leadClose = request.security(
+     symbol     = i_leadSymbol,
+     timeframe  = i_leadTimeframe,
+     expression = close,
+     gaps       = barmerge.gaps_off,
+     lookahead  = barmerge.lookahead_off
+     )
+
+// Pull leader volume
+float leadVolume = request.security(
+     symbol     = i_leadSymbol,
+     timeframe  = i_leadTimeframe,
+     expression = volume,
+     gaps       = barmerge.gaps_off,
+     lookahead  = barmerge.lookahead_off
+     )
+
+// ============================================================================
+// SECTION: Leader Direction Flip Detection
+// ============================================================================
+
+// --- EMA Slope Method ---
+// Compute a short EMA on leader close, then check if the slope
+// (current EMA - previous EMA) changed sign from the prior bar.
+float leadEma      = ta.ema(leadClose, i_emaLength)
+float leadSlope    = leadEma - leadEma[1]
+float leadSlopePrv = leadEma[1] - leadEma[2]
+
+// Slope sign flip: was positive (or zero), now negative = bearish flip
+// Was negative (or zero), now positive = bullish flip
+bool emaBullFlip = leadSlopePrv <= 0 and leadSlope > 0
+bool emaBearFlip = leadSlopePrv >= 0 and leadSlope < 0
+
+// --- ROC Zero-Cross Method ---
+// Rate of change over N bars. Zero-cross = direction flip.
+float leadRoc    = (leadClose - leadClose[i_rocLength]) / leadClose[i_rocLength] * 100.0
+float leadRocPrv = (leadClose[1] - leadClose[1 + i_rocLength]) / leadClose[1 + i_rocLength] * 100.0
+
+bool rocBullFlip = leadRocPrv <= 0 and leadRoc > 0
+bool rocBearFlip = leadRocPrv >= 0 and leadRoc < 0
+
+// --- Select based on user's chosen method ---
+bool bullFlip = i_flipMethod == "EMA Slope" ? emaBullFlip : rocBullFlip
+bool bearFlip = i_flipMethod == "EMA Slope" ? emaBearFlip : rocBearFlip
+
+// ============================================================================
+// SECTION: Volume Validation
+// ============================================================================
+
+// --- Leader volume spike ---
+// Volume on the current bar must exceed X× the N-bar SMA of volume.
+float leadVolMa    = ta.sma(leadVolume, i_volMaLength)
+bool  leadVolSpike = not na(leadVolume) and not na(leadVolMa) and
+                     leadVolMa > 0 and
+                     leadVolume > (leadVolMa * i_leadVolMult)
+
+// --- Chart symbol volume spike ---
+float chartVolMa    = ta.sma(volume, i_volMaLength)
+bool  chartVolSpike = not na(volume) and not na(chartVolMa) and
+                      chartVolMa > 0 and
+                      volume > (chartVolMa * i_chartVolMult)
+
+// ============================================================================
+// SECTION: Combined Trigger (Direction Flip + Volume)
+// ============================================================================
+
+// Leader trigger fires when direction flipped AND volume is elevated.
+bool triggerBull = bullFlip and leadVolSpike
+bool triggerBear = bearFlip and leadVolSpike
+
+// ============================================================================
+// SECTION: Chart Symbol Confirmation
+// ============================================================================
+
+// Chart symbol % change over the lookback period
+float chartPctChange = na(close[i_chartPctLookback]) ? na :
+     ((close - close[i_chartPctLookback]) / close[i_chartPctLookback]) * 100.0
+
+// Confirmation requires BOTH price move ≥ threshold AND volume spike.
+bool chartBullConfirm = not na(chartPctChange) and
+                        chartPctChange >  i_chartThreshold and
+                        chartVolSpike
+bool chartBearConfirm = not na(chartPctChange) and
+                        chartPctChange < -i_chartThreshold and
+                        chartVolSpike
+
+// ============================================================================
+// SECTION: Friendly Symbol Names
+// ============================================================================
+
+string chartName = syminfo.ticker
+string leadName  = str.contains(i_leadSymbol, ":") ?
+     str.substring(i_leadSymbol, str.pos(i_leadSymbol, ":") + 1) :
+     i_leadSymbol
+
+// ============================================================================
+// SECTION: State Machine
+// ============================================================================
+//
+// States:
+//   0 = IDLE        — waiting for leader direction flip + volume trigger
+//   1 = BULL_LEAD   — leader flipped bullish with volume, waiting for
+//                     chart to confirm (move ≥ N% up + chart volume spike)
+//   2 = BEAR_LEAD   — leader flipped bearish with volume, waiting for
+//                     chart to confirm (move ≥ N% down + chart volume spike)
+//
+// Transitions:
+//   IDLE → BULL_LEAD : bullFlip AND leadVolSpike
+//   IDLE → BEAR_LEAD : bearFlip AND leadVolSpike
+//   BULL_LEAD → IDLE : chartBullConfirm (confirmed)
+//   BULL_LEAD → IDLE : barsSinceSignal >= maxLeadBars (timeout)
+//   BEAR_LEAD → IDLE : chartBearConfirm (confirmed)
+//   BEAR_LEAD → IDLE : barsSinceSignal >= maxLeadBars (timeout)
+//   *_LEAD → opposite : opposite trigger overrides and resets
+// ============================================================================
+
+var int state           = 0
+var int barsSinceSignal = 0
+var int signalBar       = 0
+var int confirmedDirection = 0
+
+bool isConfirmBar = false
+bool isTimeoutBar = false
+bool isSignalBar  = false
+
+if state == 0
+    // ---- IDLE: check for new trigger ----
+    if triggerBull
+        state           := 1
+        barsSinceSignal := 0
+        signalBar       := bar_index
+        isSignalBar     := true
+    else if triggerBear
+        state           := 2
+        barsSinceSignal := 0
+        signalBar       := bar_index
+        isSignalBar     := true
+
+else if state == 1
+    // ---- BULL_LEAD: waiting for chart bullish confirmation ----
+    barsSinceSignal += 1
+
+    if chartBullConfirm
+        confirmedDirection := 1
+        isConfirmBar       := true
+        state              := 0
+    else if barsSinceSignal >= i_maxLeadBars
+        isTimeoutBar := true
+        state        := 0
+    else if triggerBear
+        // Opposite trigger overrides
+        state           := 2
+        barsSinceSignal := 0
+        signalBar       := bar_index
+        isSignalBar     := true
+
+else if state == 2
+    // ---- BEAR_LEAD: waiting for chart bearish confirmation ----
+    barsSinceSignal += 1
+
+    if chartBearConfirm
+        confirmedDirection := 2
+        isConfirmBar       := true
+        state              := 0
+    else if barsSinceSignal >= i_maxLeadBars
+        isTimeoutBar := true
+        state        := 0
+    else if triggerBull
+        // Opposite trigger overrides
+        state           := 1
+        barsSinceSignal := 0
+        signalBar       := bar_index
+        isSignalBar     := true
+
+// ============================================================================
+// SECTION: Background Coloring
+// ============================================================================
+
+color bgColor = switch
+    state == 1                              => i_bullColor
+    state == 2                              => i_bearColor
+    isConfirmBar and confirmedDirection == 1 => i_bullColor
+    isConfirmBar and confirmedDirection == 2 => i_bearColor
+    isTimeoutBar                            => i_timeoutColor
+    => na
+
+bgcolor(bgColor)
+
+// ============================================================================
+// SECTION: Labels
+// ============================================================================
+
+if i_showLabels
+
+    // --- Trigger label (leader flipped with volume) ---
+    if isSignalBar
+        string direction = state == 1 ? "▲ BULL FLIP" : "▼ BEAR FLIP"
+        float  volRatio  = leadVolMa > 0 ? leadVolume / leadVolMa : 0.0
+        string sigText   = leadName + " " + direction + "\n" +
+                           "Vol: " + str.tostring(volRatio, "#.#") + "×"
+        color  sigColor  = state == 1 ? color.green : color.red
+
+        label.new(
+             x         = bar_index,
+             y         = state == 1 ? low : high,
+             text      = sigText,
+             style     = state == 1 ? label.style_label_up : label.style_label_down,
+             color     = sigColor,
+             textcolor = color.white,
+             size      = size.small
+             )
+
+    // --- Confirmation label ---
+    if isConfirmBar
+        int    leadBars  = barsSinceSignal
+        string countStr  = i_showLeadCount ?
+             " | " + str.tostring(leadBars) + " bars" : ""
+        float  volRatio  = chartVolMa > 0 ? volume / chartVolMa : 0.0
+        string confText  = chartName + " Confirmed\n" +
+                           str.tostring(chartPctChange, "#.##") + "%" +
+                           " Vol:" + str.tostring(volRatio, "#.#") + "×" +
+                           countStr
+        bool   wasBull   = confirmedDirection == 1
+        color  confColor = wasBull ? color.lime : color.orange
+
+        label.new(
+             x         = bar_index,
+             y         = wasBull ? low : high,
+             text      = confText,
+             style     = wasBull ? label.style_label_up : label.style_label_down,
+             color     = confColor,
+             textcolor = color.black,
+             size      = size.small
+             )
+
+    // --- Timeout label ---
+    if isTimeoutBar
+        label.new(
+             x         = bar_index,
+             y         = high,
+             text      = "TIMEOUT\n" + str.tostring(i_maxLeadBars) + " bars",
+             style     = label.style_label_down,
+             color     = color.gray,
+             textcolor = color.white,
+             size      = size.tiny
+             )
+
+// ============================================================================
+// SECTION: Info Table
+// ============================================================================
+
+if i_tablePos != "None"
+    var table infoTable = table.new(
+         position     = tablePosition,
+         columns      = 2,
+         rows         = 6,
+         bgcolor      = color.new(color.black, 80),
+         border_width = 1
+         )
+
+    if barstate.islast
+        // Row 0: Header
+        table.cell(infoTable, 0, 0, "Lead-Lag v2",
+             text_color = color.white, text_size = size.normal,
+             bgcolor = color.new(color.blue, 70))
+        table.cell(infoTable, 1, 0, i_flipMethod,
+             text_color = color.white, text_size = size.small,
+             bgcolor = color.new(color.blue, 70))
+
+        // Row 1: Leader direction
+        string flipDir = bullFlip ? "▲ BULL" : bearFlip ? "▼ BEAR" : "—"
+        color  flipClr = bullFlip ? color.lime : bearFlip ? color.red : color.gray
+        table.cell(infoTable, 0, 1, leadName + " Dir",
+             text_color = color.silver, text_size = size.small)
+        table.cell(infoTable, 1, 1, flipDir,
+             text_color = flipClr, text_size = size.small)
+
+        // Row 2: Leader volume ratio
+        float  lvRatio = leadVolMa > 0 ? leadVolume / leadVolMa : 0.0
+        string lvStr   = str.tostring(lvRatio, "#.##") + "×"
+        color  lvClr   = leadVolSpike ? color.lime : color.gray
+        table.cell(infoTable, 0, 2, leadName + " Vol",
+             text_color = color.silver, text_size = size.small)
+        table.cell(infoTable, 1, 2, lvStr,
+             text_color = lvClr, text_size = size.small)
+
+        // Row 3: Chart % change
+        string chartStr = na(chartPctChange) ? "N/A" :
+             str.tostring(chartPctChange, "#.##") + "%"
+        color  chartClr = na(chartPctChange) ? color.gray :
+             chartPctChange > 0 ? color.lime : color.red
+        table.cell(infoTable, 0, 3, chartName + " Δ%",
+             text_color = color.silver, text_size = size.small)
+        table.cell(infoTable, 1, 3, chartStr,
+             text_color = chartClr, text_size = size.small)
+
+        // Row 4: Chart volume ratio
+        float  cvRatio = chartVolMa > 0 ? volume / chartVolMa : 0.0
+        string cvStr   = str.tostring(cvRatio, "#.##") + "×"
+        color  cvClr   = chartVolSpike ? color.lime : color.gray
+        table.cell(infoTable, 0, 4, chartName + " Vol",
+             text_color = color.silver, text_size = size.small)
+        table.cell(infoTable, 1, 4, cvStr,
+             text_color = cvClr, text_size = size.small)
+
+        // Row 5: State
+        string stateStr = switch state
+            0 => "IDLE"
+            1 => "BULL LEAD (" + str.tostring(barsSinceSignal) + ")"
+            2 => "BEAR LEAD (" + str.tostring(barsSinceSignal) + ")"
+            => "—"
+        color stateClr = switch state
+            0 => color.gray
+            1 => color.lime
+            2 => color.red
+            => color.gray
+        table.cell(infoTable, 0, 5, "State",
+             text_color = color.silver, text_size = size.small)
+        table.cell(infoTable, 1, 5, stateStr,
+             text_color = stateClr, text_size = size.small)
+
+// ============================================================================
+// SECTION: Debug Markers
+// ============================================================================
+
+// Diamonds = leader direction flip (before volume gate)
+plotshape(i_debug and bullFlip, title="DBG: Bull Flip",
+     style=shape.diamond, location=location.abovebar,
+     color=color.new(color.lime, 30), size=size.tiny)
+
+plotshape(i_debug and bearFlip, title="DBG: Bear Flip",
+     style=shape.diamond, location=location.abovebar,
+     color=color.new(color.red, 30), size=size.tiny)
+
+// Triangles = leader volume spike
+plotshape(i_debug and leadVolSpike, title="DBG: Leader Vol Spike",
+     style=shape.triangleup, location=location.belowbar,
+     color=color.new(color.yellow, 40), size=size.tiny)
+
+// Crosses = chart confirmation conditions met (price + volume)
+plotshape(i_debug and chartBullConfirm, title="DBG: Chart Bull Confirm",
+     style=shape.xcross, location=location.belowbar,
+     color=color.new(color.lime, 40), size=size.tiny)
+
+plotshape(i_debug and chartBearConfirm, title="DBG: Chart Bear Confirm",
+     style=shape.xcross, location=location.belowbar,
+     color=color.new(color.red, 40), size=size.tiny)
+
+// ============================================================================
+// END OF INDICATOR
+// ============================================================================
